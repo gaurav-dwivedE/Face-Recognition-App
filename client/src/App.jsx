@@ -1,14 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
 
 const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
-const TARGET_POLL_MS = 90;
-const CAPTURE_MAX_WIDTH = 1600;
-const JPEG_QUALITY = 0.8;
-const KNOWN_TRACK_TTL_MS = 900;
-const UNKNOWN_TRACK_TTL_MS = 520;
-const TRACK_SMOOTH_ALPHA = 0.52;
-const TRACK_PREDICT_MS = 120;
-const LOCAL_DETECT_MS = 34;
+const TARGET_POLL_MS = 45;
+const CAPTURE_MAX_WIDTH = 1400;
+const JPEG_QUALITY = 0.74;
+const KNOWN_TRACK_TTL_MS = 950;
+const UNKNOWN_TRACK_TTL_MS = 620;
+const TRACK_SMOOTH_ALPHA = 0.72;
+const TRACK_PREDICT_MS = 240;
 
 const mergePersistentMatches = (previous, incoming) => {
   const now = Date.now();
@@ -132,6 +131,16 @@ const bboxIoU = (a, b) => {
   return intersection / union;
 };
 
+const bboxCenterDistance = (a, b) => {
+  const ax = (a.left + a.right) * 0.5;
+  const ay = (a.top + a.bottom) * 0.5;
+  const bx = (b.left + b.right) * 0.5;
+  const by = (b.top + b.bottom) * 0.5;
+  return Math.hypot(ax - bx, ay - by);
+};
+
+const bboxDiag = (b) => Math.hypot(b.right - b.left, b.bottom - b.top);
+
 const lerp = (a, b, alpha) => a + (b - a) * alpha;
 
 const smoothBbox = (current, target, alpha) => ({
@@ -198,7 +207,7 @@ export default function App() {
   const streamRef = useRef(null);
   const timerRef = useRef(null);
   const rafRef = useRef(null);
-  const localDetectTimerRef = useRef(null);
+  const localDetectRafRef = useRef(null);
   const localDetectInFlightRef = useRef(false);
   const inFlightRef = useRef(false);
   const isRunningRef = useRef(false);
@@ -221,9 +230,9 @@ export default function App() {
   };
 
   const stopLocalDetectLoop = () => {
-    if (localDetectTimerRef.current) {
-      clearTimeout(localDetectTimerRef.current);
-      localDetectTimerRef.current = null;
+    if (localDetectRafRef.current) {
+      cancelAnimationFrame(localDetectRafRef.current);
+      localDetectRafRef.current = null;
     }
     localDetectInFlightRef.current = false;
   };
@@ -365,11 +374,17 @@ export default function App() {
       if (!face.bbox) return;
 
       let matchedTrack = null;
-      let bestScore = 0.1;
+      let bestScore = 0.18;
 
       for (const candidate of unknownCandidates) {
         if (usedUnknownTrackKeys.has(candidate.key)) continue;
-        const score = bboxIoU(candidate.target, face.bbox);
+
+        const iou = bboxIoU(candidate.target, face.bbox);
+        const centerDistance = bboxCenterDistance(candidate.target, face.bbox);
+        const maxDistance = Math.max(24, (bboxDiag(candidate.target) + bboxDiag(face.bbox)) * 0.55);
+        const distanceScore = Math.max(0, 1 - centerDistance / maxDistance);
+        const score = Math.max(iou, distanceScore * 0.9);
+
         if (score > bestScore) {
           bestScore = score;
           matchedTrack = candidate;
@@ -399,8 +414,13 @@ export default function App() {
       trackMapRef.current.forEach((track) => {
         if (usedTrackKeys.has(track.key)) return;
 
-        const threshold = track.kind === "known" ? 0.08 : 0.12;
-        const score = bboxIoU(track.target, bbox);
+        const iou = bboxIoU(track.target, bbox);
+        const centerDistance = bboxCenterDistance(track.target, bbox);
+        const maxDistance = Math.max(24, (bboxDiag(track.target) + bboxDiag(bbox)) * 0.55);
+        const distanceScore = Math.max(0, 1 - centerDistance / maxDistance);
+        const score = Math.max(iou, distanceScore * 0.9);
+        const threshold = track.kind === "known" ? 0.2 : 0.24;
+
         if (score > threshold && score > bestScore) {
           bestScore = score;
           bestTrack = track;
@@ -419,7 +439,7 @@ export default function App() {
     });
   };
 
-  const runLocalDetectLoop = async () => {
+  const runLocalDetectLoop = () => {
     if (!isRunningRef.current) return;
 
     const detector = faceDetectorRef.current;
@@ -435,22 +455,21 @@ export default function App() {
     ) {
       localDetectInFlightRef.current = true;
 
-      try {
-        const detections = await detector.detect(video);
-        if (isRunningRef.current) {
+      detector
+        .detect(video)
+        .then((detections) => {
+          if (!isRunningRef.current) return;
           updateTracksFromLocalDetection(detections || [], video.videoWidth, video.videoHeight);
-        }
-      } catch {
-        // Ignore detector errors and keep server recognition running.
-      } finally {
-        localDetectInFlightRef.current = false;
-      }
+        })
+        .catch(() => {
+          // Ignore detector errors and keep server recognition running.
+        })
+        .finally(() => {
+          localDetectInFlightRef.current = false;
+        });
     }
 
-    if (!isRunningRef.current) return;
-    localDetectTimerRef.current = setTimeout(() => {
-      runLocalDetectLoop();
-    }, LOCAL_DETECT_MS);
+    localDetectRafRef.current = requestAnimationFrame(runLocalDetectLoop);
   };
 
   const stopLiveRecognition = () => {

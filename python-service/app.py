@@ -21,16 +21,21 @@ MIN_FACE_SIZE = int(os.getenv("MIN_FACE_SIZE", "20"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 REPO_ROOT = os.getenv("REPO_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 FACE_DETECTION_MODEL = os.getenv("FACE_DETECTION_MODEL", "hog")
-PRIMARY_DETECTION_SCALE = float(os.getenv("PRIMARY_DETECTION_SCALE", "1.35"))
+PRIMARY_DETECTION_SCALE = float(os.getenv("PRIMARY_DETECTION_SCALE", "1.45"))
 PRIMARY_UPSAMPLE = int(os.getenv("PRIMARY_UPSAMPLE", "1"))
-SECONDARY_DETECTION_SCALE = float(os.getenv("SECONDARY_DETECTION_SCALE", "1.15"))
-SECONDARY_UPSAMPLE = int(os.getenv("SECONDARY_UPSAMPLE", "0"))
-SECONDARY_EVERY_N_FRAMES = max(1, int(os.getenv("SECONDARY_EVERY_N_FRAMES", "3")))
+SECONDARY_DETECTION_SCALE = float(os.getenv("SECONDARY_DETECTION_SCALE", "1.6"))
+SECONDARY_UPSAMPLE = int(os.getenv("SECONDARY_UPSAMPLE", "1"))
+SECONDARY_EVERY_N_FRAMES = max(1, int(os.getenv("SECONDARY_EVERY_N_FRAMES", "4")))
+FAR_DETECTION_SCALE = float(os.getenv("FAR_DETECTION_SCALE", "1.9"))
+FAR_UPSAMPLE = int(os.getenv("FAR_UPSAMPLE", "2"))
+FAR_SCAN_ON_EMPTY = os.getenv("FAR_SCAN_ON_EMPTY", "1") == "1"
 KNOWN_NUM_JITTERS = int(os.getenv("KNOWN_NUM_JITTERS", "1"))
 FRAME_NUM_JITTERS = int(os.getenv("FRAME_NUM_JITTERS", "1"))
-MAX_FRAME_SIDE = int(os.getenv("MAX_FRAME_SIDE", "1280"))
-SNAPSHOT_MAX_SIDE = int(os.getenv("SNAPSHOT_MAX_SIDE", "112"))
-SNAPSHOT_JPEG_QUALITY = int(os.getenv("SNAPSHOT_JPEG_QUALITY", "60"))
+MAX_FRAME_SIDE = int(os.getenv("MAX_FRAME_SIDE", "1600"))
+SNAPSHOT_MAX_SIDE = int(os.getenv("SNAPSHOT_MAX_SIDE", "96"))
+SNAPSHOT_JPEG_QUALITY = int(os.getenv("SNAPSHOT_JPEG_QUALITY", "55"))
+RETURN_MATCH_SNAPSHOTS = os.getenv("RETURN_MATCH_SNAPSHOTS", "1") == "1"
+MATCH_SNAPSHOT_INTERVAL_MS = max(0, int(os.getenv("MATCH_SNAPSHOT_INTERVAL_MS", "1100")))
 RETURN_UNKNOWN_SNAPSHOTS = os.getenv("RETURN_UNKNOWN_SNAPSHOTS", "0") == "1"
 
 app = Flask(__name__)
@@ -41,6 +46,7 @@ _cached_faces = {
     "user_ids": []
 }
 _live_frame_counter = 0
+_last_match_snapshot_at = {}
 
 
 def _abs_path(path_str):
@@ -243,6 +249,22 @@ def _append_unknown_face(unknown_faces, bbox, face_crop):
     unknown_faces.append(payload)
 
 
+def _should_emit_match_snapshot(user_id):
+    if not RETURN_MATCH_SNAPSHOTS:
+        return False
+
+    if MATCH_SNAPSHOT_INTERVAL_MS == 0:
+        return True
+
+    now_ms = int(time.time() * 1000)
+    last_ms = _last_match_snapshot_at.get(user_id, 0)
+    if (now_ms - last_ms) < MATCH_SNAPSHOT_INTERVAL_MS:
+        return False
+
+    _last_match_snapshot_at[user_id] = now_ms
+    return True
+
+
 def analyze_frame(frame, known_embeddings, known_user_ids):
     global _live_frame_counter
 
@@ -261,12 +283,20 @@ def analyze_frame(frame, known_embeddings, known_user_ids):
     face_locations = primary_locations
     face_encodings = primary_encodings
 
-    run_secondary = (_live_frame_counter % SECONDARY_EVERY_N_FRAMES == 0) or len(primary_locations) == 0
+    run_secondary = (_live_frame_counter % SECONDARY_EVERY_N_FRAMES == 0)
+    secondary_scale = SECONDARY_DETECTION_SCALE
+    secondary_upsample = SECONDARY_UPSAMPLE
+
+    if FAR_SCAN_ON_EMPTY and len(primary_locations) == 0:
+        run_secondary = True
+        secondary_scale = FAR_DETECTION_SCALE
+        secondary_upsample = FAR_UPSAMPLE
+
     if run_secondary:
         secondary_locations, secondary_encodings = _detect_faces_pass(
             rgb,
-            SECONDARY_DETECTION_SCALE,
-            SECONDARY_UPSAMPLE,
+            secondary_scale,
+            secondary_upsample,
             FRAME_NUM_JITTERS
         )
 
@@ -313,12 +343,16 @@ def analyze_frame(frame, known_embeddings, known_user_ids):
         user_id = known_user_ids[best_index]
         confidence = max(0.0, min(1.0, 1.0 - best_distance))
 
+        snapshot = None
+        if _should_emit_match_snapshot(user_id):
+            snapshot = frame_to_base64(face_crop)
+
         existing = matched.get(user_id)
         if not existing or confidence > existing["confidence"]:
             matched[user_id] = {
                 "userId": user_id,
                 "confidence": confidence,
-                "snapshot": frame_to_base64(face_crop),
+                "snapshot": snapshot,
                 "bbox": bbox
             }
 
