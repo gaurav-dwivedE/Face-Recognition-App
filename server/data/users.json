@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Alex Johnson",
+    "employeeId": "EMP-001",
+    "imagePath": "shared/known_faces/alex.jpg",
+    "metadata": { "department": "Engineering" }
+  },
+  {
+    "name": "Priya Singh",
+    "employeeId": "EMP-002",
+    "imagePath": "shared/known_faces/priya.jpg",
+    "metadata": { "department": "Design" }
+  }
+]
