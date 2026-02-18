@@ -1,7 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 
 const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
-const POLL_MS = 900;
+const TARGET_POLL_MS = 90;
+const CAPTURE_MAX_WIDTH = 1600;
+const JPEG_QUALITY = 0.8;
+const KNOWN_TRACK_TTL_MS = 900;
+const UNKNOWN_TRACK_TTL_MS = 520;
+const TRACK_SMOOTH_ALPHA = 0.52;
+const TRACK_PREDICT_MS = 120;
+const LOCAL_DETECT_MS = 34;
 
 const mergePersistentMatches = (previous, incoming) => {
   const now = Date.now();
@@ -81,6 +88,99 @@ const formatLastSeen = (timestamp) => {
   });
 };
 
+const scaleDetections = (items, scaleX, scaleY) =>
+  items
+    .map((item) => {
+      if (!item.bbox) return item;
+
+      return {
+        ...item,
+        bbox: {
+          left: item.bbox.left * scaleX,
+          top: item.bbox.top * scaleY,
+          right: item.bbox.right * scaleX,
+          bottom: item.bbox.bottom * scaleY
+        }
+      };
+    })
+    .filter((item) => item.bbox);
+
+const clampBbox = (bbox, width, height) => {
+  const left = Math.max(0, Math.min(width - 2, bbox.left));
+  const top = Math.max(0, Math.min(height - 2, bbox.top));
+  const right = Math.max(left + 2, Math.min(width, bbox.right));
+  const bottom = Math.max(top + 2, Math.min(height, bbox.bottom));
+
+  return { left, top, right, bottom };
+};
+
+const bboxIoU = (a, b) => {
+  const interLeft = Math.max(a.left, b.left);
+  const interTop = Math.max(a.top, b.top);
+  const interRight = Math.min(a.right, b.right);
+  const interBottom = Math.min(a.bottom, b.bottom);
+
+  const iw = Math.max(0, interRight - interLeft);
+  const ih = Math.max(0, interBottom - interTop);
+  const intersection = iw * ih;
+
+  const areaA = Math.max(0, a.right - a.left) * Math.max(0, a.bottom - a.top);
+  const areaB = Math.max(0, b.right - b.left) * Math.max(0, b.bottom - b.top);
+  const union = areaA + areaB - intersection;
+
+  if (union <= 0) return 0;
+  return intersection / union;
+};
+
+const lerp = (a, b, alpha) => a + (b - a) * alpha;
+
+const smoothBbox = (current, target, alpha) => ({
+  left: lerp(current.left, target.left, alpha),
+  top: lerp(current.top, target.top, alpha),
+  right: lerp(current.right, target.right, alpha),
+  bottom: lerp(current.bottom, target.bottom, alpha)
+});
+
+const drawTrackLabel = (ctx, track) => {
+  const label = track.label;
+  ctx.font = "13px 'IBM Plex Mono', monospace";
+  ctx.fillStyle = track.labelBg;
+  const textWidth = ctx.measureText(label).width;
+  const labelX = track.current.left;
+  const labelY = Math.max(18, track.current.top - 8);
+
+  ctx.fillRect(labelX - 4, labelY - 15, textWidth + 8, 18);
+  ctx.fillStyle = track.labelColor;
+  ctx.fillText(label, labelX, labelY - 2);
+};
+
+const makeUnknownPayload = (bbox) => ({
+  bbox,
+  label: "? Unknown",
+  color: "#ff5d5d",
+  labelBg: "rgba(52, 6, 6, 0.86)",
+  labelColor: "#ffd6d6"
+});
+
+const localFaceBBox = (detection) => {
+  const box = detection?.boundingBox;
+  if (!box) return null;
+
+  const left = Number(box.x ?? box.left ?? 0);
+  const top = Number(box.y ?? box.top ?? 0);
+  const width = Number(box.width ?? 0);
+  const height = Number(box.height ?? 0);
+
+  if (!(width > 0 && height > 0)) return null;
+
+  return {
+    left,
+    top,
+    right: left + width,
+    bottom: top + height
+  };
+};
+
 export default function App() {
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState("Idle");
@@ -90,13 +190,21 @@ export default function App() {
   const [reg, setReg] = useState({ name: "", studentId: "", image: null });
   const [regStatus, setRegStatus] = useState("Idle");
   const [regError, setRegError] = useState("");
+  const [trackerMode, setTrackerMode] = useState("Server");
 
   const videoRef = useRef(null);
   const captureCanvasRef = useRef(null);
   const overlayCanvasRef = useRef(null);
   const streamRef = useRef(null);
   const timerRef = useRef(null);
+  const rafRef = useRef(null);
+  const localDetectTimerRef = useRef(null);
+  const localDetectInFlightRef = useRef(false);
   const inFlightRef = useRef(false);
+  const isRunningRef = useRef(false);
+  const trackMapRef = useRef(new Map());
+  const unknownTrackIdRef = useRef(1);
+  const faceDetectorRef = useRef(null);
 
   const clearOverlay = () => {
     const overlay = overlayCanvasRef.current;
@@ -105,57 +213,249 @@ export default function App() {
     ctx.clearRect(0, 0, overlay.width, overlay.height);
   };
 
-  const drawDetections = (matches, unknownList, width, height) => {
-    const overlay = overlayCanvasRef.current;
-    if (!overlay) return;
+  const stopOverlayLoop = () => {
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+  };
 
-    overlay.width = width;
-    overlay.height = height;
+  const stopLocalDetectLoop = () => {
+    if (localDetectTimerRef.current) {
+      clearTimeout(localDetectTimerRef.current);
+      localDetectTimerRef.current = null;
+    }
+    localDetectInFlightRef.current = false;
+  };
+
+  const updateTrackSignal = (track, bbox, now) => {
+    const dt = Math.max(1, now - (track.lastSignalAt || now));
+
+    track.velocity = {
+      left: (bbox.left - track.target.left) / dt,
+      top: (bbox.top - track.target.top) / dt,
+      right: (bbox.right - track.target.right) / dt,
+      bottom: (bbox.bottom - track.target.bottom) / dt
+    };
+    track.target = { ...bbox };
+    track.lastSignalAt = now;
+    track.lastSeen = now;
+  };
+
+  const upsertTrack = (key, payload, kind) => {
+    const now = Date.now();
+    const existing = trackMapRef.current.get(key);
+
+    if (!existing) {
+      const initial = { ...payload.bbox };
+      trackMapRef.current.set(key, {
+        key,
+        kind,
+        color: payload.color,
+        labelBg: payload.labelBg,
+        labelColor: payload.labelColor,
+        label: payload.label,
+        current: initial,
+        target: initial,
+        velocity: { left: 0, top: 0, right: 0, bottom: 0 },
+        lastSeen: now,
+        lastSignalAt: now
+      });
+      return;
+    }
+
+    existing.label = payload.label;
+    existing.color = payload.color;
+    existing.labelBg = payload.labelBg;
+    existing.labelColor = payload.labelColor;
+    updateTrackSignal(existing, payload.bbox, now);
+  };
+
+  const touchTrack = (track, bbox) => {
+    const now = Date.now();
+    updateTrackSignal(track, bbox, now);
+  };
+
+  const drawTracks = () => {
+    const video = videoRef.current;
+    const overlay = overlayCanvasRef.current;
+    if (!video || !overlay) return;
+
+    const width = video.videoWidth || 0;
+    const height = video.videoHeight || 0;
+    if (!width || !height) return;
+
+    if (overlay.width !== width || overlay.height !== height) {
+      overlay.width = width;
+      overlay.height = height;
+    }
 
     const ctx = overlay.getContext("2d");
-    ctx.clearRect(0, 0, width, height);
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+    const now = Date.now();
+    const toDelete = [];
+
+    trackMapRef.current.forEach((track, key) => {
+      const ttl = track.kind === "known" ? KNOWN_TRACK_TTL_MS : UNKNOWN_TRACK_TTL_MS;
+      if (now - track.lastSeen > ttl) {
+        toDelete.push(key);
+        return;
+      }
+
+      const predictMs = Math.min(TRACK_PREDICT_MS, now - (track.lastSignalAt || now));
+      const predicted = {
+        left: track.target.left + track.velocity.left * predictMs,
+        top: track.target.top + track.velocity.top * predictMs,
+        right: track.target.right + track.velocity.right * predictMs,
+        bottom: track.target.bottom + track.velocity.bottom * predictMs
+      };
+
+      const boundedPredicted = clampBbox(predicted, width, height);
+      track.current = smoothBbox(track.current, boundedPredicted, TRACK_SMOOTH_ALPHA);
+      track.current = clampBbox(track.current, width, height);
+
+      drawBracket(ctx, track.current.left, track.current.top, track.current.right, track.current.bottom, track.color);
+      drawTarget(ctx, track.current.left, track.current.top, track.current.right, track.current.bottom, track.color);
+      drawTrackLabel(ctx, track);
+    });
+
+    toDelete.forEach((key) => trackMapRef.current.delete(key));
+  };
+
+  const overlayLoop = () => {
+    if (!isRunningRef.current) return;
+    drawTracks();
+    rafRef.current = requestAnimationFrame(overlayLoop);
+  };
+
+  const startOverlayLoop = () => {
+    stopOverlayLoop();
+    rafRef.current = requestAnimationFrame(overlayLoop);
+  };
+
+  const updateTracksFromRecognition = (matches, unknownFaces) => {
+    const unknownCandidates = [];
+    trackMapRef.current.forEach((track) => {
+      if (track.kind === "unknown") {
+        unknownCandidates.push(track);
+      }
+    });
+
+    const usedUnknownTrackKeys = new Set();
 
     matches.forEach((match) => {
       if (!match.bbox) return;
+      const key = `known-${match.user.id}`;
 
-      const { left, top, right, bottom } = match.bbox;
-      drawBracket(ctx, left, top, right, bottom, "#59c88e");
-      drawTarget(ctx, left, top, right, bottom, "#59c88e");
-
-      const label = `${match.user.name} ${(match.confidence * 100).toFixed(0)}%`;
-      ctx.font = "13px 'IBM Plex Mono', monospace";
-      ctx.fillStyle = "rgba(10, 14, 20, 0.86)";
-      const textWidth = ctx.measureText(label).width;
-      const labelX = left;
-      const labelY = Math.max(18, top - 8);
-
-      ctx.fillRect(labelX - 4, labelY - 15, textWidth + 8, 18);
-      ctx.fillStyle = "#ffffff";
-      ctx.fillText(label, labelX, labelY - 2);
+      upsertTrack(
+        key,
+        {
+          bbox: match.bbox,
+          label: `${match.user.name} ${(match.confidence * 100).toFixed(0)}%`,
+          color: "#59c88e",
+          labelBg: "rgba(10, 14, 20, 0.86)",
+          labelColor: "#ffffff"
+        },
+        "known"
+      );
     });
 
-    unknownList.forEach((face) => {
+    unknownFaces.forEach((face) => {
       if (!face.bbox) return;
 
-      const { left, top, right, bottom } = face.bbox;
-      drawBracket(ctx, left, top, right, bottom, "#ff5d5d");
-      drawTarget(ctx, left, top, right, bottom, "#ff5d5d");
+      let matchedTrack = null;
+      let bestScore = 0.1;
 
-      const label = "? Unknown";
-      ctx.font = "13px 'IBM Plex Mono', monospace";
-      ctx.fillStyle = "rgba(52, 6, 6, 0.86)";
-      const textWidth = ctx.measureText(label).width;
-      const labelX = left;
-      const labelY = Math.max(18, top - 8);
-      ctx.fillRect(labelX - 4, labelY - 15, textWidth + 8, 18);
-      ctx.fillStyle = "#ffd6d6";
-      ctx.fillText(label, labelX, labelY - 2);
+      for (const candidate of unknownCandidates) {
+        if (usedUnknownTrackKeys.has(candidate.key)) continue;
+        const score = bboxIoU(candidate.target, face.bbox);
+        if (score > bestScore) {
+          bestScore = score;
+          matchedTrack = candidate;
+        }
+      }
+
+      const key = matchedTrack?.key || `unknown-${unknownTrackIdRef.current++}`;
+      usedUnknownTrackKeys.add(key);
+
+      upsertTrack(key, makeUnknownPayload(face.bbox), "unknown");
     });
+  };
+
+  const updateTracksFromLocalDetection = (detections, width, height) => {
+    if (detections.length === 0) return;
+
+    const usedTrackKeys = new Set();
+
+    detections.forEach((det) => {
+      const rawBbox = localFaceBBox(det);
+      if (!rawBbox) return;
+
+      const bbox = clampBbox(rawBbox, width, height);
+      let bestTrack = null;
+      let bestScore = 0;
+
+      trackMapRef.current.forEach((track) => {
+        if (usedTrackKeys.has(track.key)) return;
+
+        const threshold = track.kind === "known" ? 0.08 : 0.12;
+        const score = bboxIoU(track.target, bbox);
+        if (score > threshold && score > bestScore) {
+          bestScore = score;
+          bestTrack = track;
+        }
+      });
+
+      if (bestTrack) {
+        touchTrack(bestTrack, bbox);
+        usedTrackKeys.add(bestTrack.key);
+        return;
+      }
+
+      const key = `unknown-${unknownTrackIdRef.current++}`;
+      upsertTrack(key, makeUnknownPayload(bbox), "unknown");
+      usedTrackKeys.add(key);
+    });
+  };
+
+  const runLocalDetectLoop = async () => {
+    if (!isRunningRef.current) return;
+
+    const detector = faceDetectorRef.current;
+    const video = videoRef.current;
+
+    if (
+      detector &&
+      video &&
+      video.readyState >= 2 &&
+      !localDetectInFlightRef.current &&
+      (video.videoWidth || 0) > 0 &&
+      (video.videoHeight || 0) > 0
+    ) {
+      localDetectInFlightRef.current = true;
+
+      try {
+        const detections = await detector.detect(video);
+        if (isRunningRef.current) {
+          updateTracksFromLocalDetection(detections || [], video.videoWidth, video.videoHeight);
+        }
+      } catch {
+        // Ignore detector errors and keep server recognition running.
+      } finally {
+        localDetectInFlightRef.current = false;
+      }
+    }
+
+    if (!isRunningRef.current) return;
+    localDetectTimerRef.current = setTimeout(() => {
+      runLocalDetectLoop();
+    }, LOCAL_DETECT_MS);
   };
 
   const stopLiveRecognition = () => {
     if (timerRef.current) {
-      clearInterval(timerRef.current);
+      clearTimeout(timerRef.current);
       timerRef.current = null;
     }
 
@@ -168,15 +468,21 @@ export default function App() {
       videoRef.current.srcObject = null;
     }
 
+    isRunningRef.current = false;
     inFlightRef.current = false;
+    stopOverlayLoop();
+    stopLocalDetectLoop();
+    faceDetectorRef.current = null;
+    trackMapRef.current.clear();
     clearOverlay();
     setLiveUserIds([]);
     setCameraOn(false);
     setStatus("Stopped");
+    setTrackerMode("Server");
   };
 
   const recognizeCurrentFrame = async () => {
-    if (!videoRef.current || !captureCanvasRef.current || inFlightRef.current) {
+    if (!videoRef.current || !captureCanvasRef.current || inFlightRef.current || !isRunningRef.current) {
       return;
     }
 
@@ -185,53 +491,79 @@ export default function App() {
       return;
     }
 
-    const width = video.videoWidth || 640;
-    const height = video.videoHeight || 360;
+    const sourceWidth = video.videoWidth || 640;
+    const sourceHeight = video.videoHeight || 360;
+    const sendScale = sourceWidth > CAPTURE_MAX_WIDTH ? CAPTURE_MAX_WIDTH / sourceWidth : 1;
+    const sendWidth = Math.max(320, Math.round(sourceWidth * sendScale));
+    const sendHeight = Math.max(180, Math.round(sourceHeight * sendScale));
 
     const captureCanvas = captureCanvasRef.current;
-    captureCanvas.width = width;
-    captureCanvas.height = height;
+    captureCanvas.width = sendWidth;
+    captureCanvas.height = sendHeight;
 
     const ctx = captureCanvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, width, height);
+    ctx.drawImage(video, 0, 0, sendWidth, sendHeight);
 
     inFlightRef.current = true;
-    captureCanvas.toBlob(async (blob) => {
+
+    try {
+      const blob = await new Promise((resolve) => {
+        captureCanvas.toBlob(resolve, "image/jpeg", JPEG_QUALITY);
+      });
+
       if (!blob) {
-        inFlightRef.current = false;
         return;
       }
 
-      try {
-        const formData = new FormData();
-        formData.append("frame", blob, "frame.jpg");
+      const formData = new FormData();
+      formData.append("frame", blob, "frame.jpg");
 
-        const response = await fetch(`${apiUrl}/recognize/frame`, {
-          method: "POST",
-          body: formData
-        });
+      const response = await fetch(`${apiUrl}/recognize/frame`, {
+        method: "POST",
+        body: formData,
+        cache: "no-store"
+      });
 
-        if (!response.ok) {
-          throw new Error("Live recognition failed.");
-        }
-
-        const data = await response.json();
-        const frameMatches = data.matches || [];
-        const frameUnknown = data.unknownFaces || [];
-
-        setResults((prev) => mergePersistentMatches(prev, frameMatches));
-        setLiveUserIds(frameMatches.map((item) => item.user.id));
-        drawDetections(frameMatches, frameUnknown, width, height);
-
-        setStatus("Running");
-        setError("");
-      } catch (err) {
-        setStatus("Failed");
-        setError(err.message || "Live recognition failed.");
-      } finally {
-        inFlightRef.current = false;
+      if (!response.ok) {
+        throw new Error("Live recognition failed.");
       }
-    }, "image/jpeg", 0.85);
+
+      const data = await response.json();
+      const frameMatches = data.matches || [];
+      const frameUnknown = data.unknownFaces || [];
+
+      const scaleX = sourceWidth / sendWidth;
+      const scaleY = sourceHeight / sendHeight;
+      const scaledMatches = scaleDetections(frameMatches, scaleX, scaleY);
+      const scaledUnknown = scaleDetections(frameUnknown, scaleX, scaleY);
+
+      updateTracksFromRecognition(scaledMatches, scaledUnknown);
+      setResults((prev) => mergePersistentMatches(prev, scaledMatches));
+      setLiveUserIds(scaledMatches.map((item) => item.user.id));
+
+      setStatus("Running");
+      setError("");
+    } catch (err) {
+      setStatus("Failed");
+      setError(err.message || "Live recognition failed.");
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
+
+  const runRecognitionLoop = async () => {
+    if (!isRunningRef.current) return;
+
+    const startedAt = performance.now();
+    await recognizeCurrentFrame();
+
+    if (!isRunningRef.current) return;
+
+    const elapsed = performance.now() - startedAt;
+    const delay = Math.max(0, TARGET_POLL_MS - elapsed);
+    timerRef.current = setTimeout(() => {
+      runRecognitionLoop();
+    }, delay);
   };
 
   const startLiveRecognition = async () => {
@@ -244,7 +576,12 @@ export default function App() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, min: 15 } },
+        video: {
+          facingMode: "user",
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 60, min: 24 }
+        },
         audio: false
       });
 
@@ -254,10 +591,30 @@ export default function App() {
         await videoRef.current.play();
       }
 
+      faceDetectorRef.current = null;
+      if ("FaceDetector" in window) {
+        try {
+          faceDetectorRef.current = new window.FaceDetector({
+            fastMode: true,
+            maxDetectedFaces: 20
+          });
+        } catch {
+          faceDetectorRef.current = null;
+        }
+      }
+
+      trackMapRef.current.clear();
+      unknownTrackIdRef.current = 1;
+      isRunningRef.current = true;
       setCameraOn(true);
       setStatus("Starting");
-      recognizeCurrentFrame();
-      timerRef.current = setInterval(recognizeCurrentFrame, POLL_MS);
+      setTrackerMode(faceDetectorRef.current ? "Server + Local" : "Server");
+
+      startOverlayLoop();
+      if (faceDetectorRef.current) {
+        runLocalDetectLoop();
+      }
+      runRecognitionLoop();
     } catch {
       setError("Unable to access camera. Allow camera permission and retry.");
       setStatus("Failed");
@@ -344,7 +701,7 @@ export default function App() {
         <section className="card">
           <div className="section-head">
             <h2>Live Camera</h2>
-            <span className="subtext">Frame scan every {POLL_MS}ms</span>
+            <span className="subtext">Smooth tracking mode: {trackerMode}</span>
           </div>
           <div className="camera-box">
             <video ref={videoRef} autoPlay playsInline muted />
