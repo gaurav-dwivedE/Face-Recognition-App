@@ -15,9 +15,14 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/face_recognition")
 DB_NAME = os.getenv("MONGO_DB", "face_recognition")
 COLLECTION_NAME = os.getenv("MONGO_COLLECTION", "users")
 FRAME_INTERVAL = int(os.getenv("FRAME_INTERVAL", "5"))
-MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.6"))
+MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.46"))
+MATCH_MARGIN = float(os.getenv("MATCH_MARGIN", "0.05"))
+MIN_FACE_SIZE = int(os.getenv("MIN_FACE_SIZE", "36"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 REPO_ROOT = os.getenv("REPO_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+FACE_DETECTION_MODEL = os.getenv("FACE_DETECTION_MODEL", "hog")
+KNOWN_NUM_JITTERS = int(os.getenv("KNOWN_NUM_JITTERS", "2"))
+FRAME_NUM_JITTERS = int(os.getenv("FRAME_NUM_JITTERS", "1"))
 
 app = Flask(__name__)
 
@@ -32,6 +37,10 @@ def _abs_path(path_str):
     if os.path.isabs(path_str):
         return path_str
     return os.path.join(REPO_ROOT, path_str)
+
+
+def _valid_face_size(top, right, bottom, left):
+    return (bottom - top) >= MIN_FACE_SIZE and (right - left) >= MIN_FACE_SIZE
 
 
 def load_known_faces(force=False):
@@ -58,12 +67,24 @@ def load_known_faces(force=False):
             continue
 
         image = face_recognition.load_image_file(abs_path)
-        encodings = face_recognition.face_encodings(image)
+        locations = face_recognition.face_locations(image, model=FACE_DETECTION_MODEL)
+        if not locations:
+            continue
+
+        encodings = face_recognition.face_encodings(
+            image,
+            known_face_locations=locations,
+            num_jitters=KNOWN_NUM_JITTERS
+        )
         if not encodings:
             continue
 
-        embeddings.append(encodings[0])
-        user_ids.append(str(user.get("_id")))
+        for location, encoding in zip(locations, encodings):
+            top, right, bottom, left = location
+            if not _valid_face_size(top, right, bottom, left):
+                continue
+            embeddings.append(encoding)
+            user_ids.append(str(user.get("_id")))
 
     client.close()
 
@@ -83,56 +104,81 @@ def frame_to_base64(frame):
     return base64.b64encode(buffer).decode("utf-8")
 
 
-def match_faces_in_frame(frame, known_embeddings, known_user_ids):
-    if len(known_embeddings) == 0:
-        return []
+def _is_ambiguous_match(distances):
+    if len(distances) < 2:
+        return False
 
+    sorted_distances = np.sort(distances)
+    best = float(sorted_distances[0])
+    second_best = float(sorted_distances[1])
+    return (second_best - best) < MATCH_MARGIN
+
+
+def analyze_frame(frame, known_embeddings, known_user_ids):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    face_locations = face_recognition.face_locations(rgb)
-    face_encodings = face_recognition.face_encodings(rgb, face_locations)
+    face_locations = face_recognition.face_locations(rgb, model=FACE_DETECTION_MODEL)
+    face_encodings = face_recognition.face_encodings(
+        rgb,
+        known_face_locations=face_locations,
+        num_jitters=FRAME_NUM_JITTERS
+    )
 
-    results = {}
+    matched = {}
+    unknown_faces = []
 
     for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+        face_crop = frame[top:bottom, left:right]
+        snapshot = frame_to_base64(face_crop) if face_crop.size else None
+
+        bbox = {
+            "top": int(top),
+            "right": int(right),
+            "bottom": int(bottom),
+            "left": int(left)
+        }
+
+        if not _valid_face_size(top, right, bottom, left):
+            unknown_faces.append({"bbox": bbox, "snapshot": snapshot})
+            continue
+
+        if len(known_embeddings) == 0:
+            unknown_faces.append({"bbox": bbox, "snapshot": snapshot})
+            continue
+
         distances = face_recognition.face_distance(known_embeddings, face_encoding)
         if len(distances) == 0:
+            unknown_faces.append({"bbox": bbox, "snapshot": snapshot})
             continue
 
         best_index = int(np.argmin(distances))
         best_distance = float(distances[best_index])
 
-        if best_distance > MATCH_THRESHOLD:
+        if best_distance > MATCH_THRESHOLD or _is_ambiguous_match(distances):
+            unknown_faces.append({"bbox": bbox, "snapshot": snapshot})
             continue
 
         user_id = known_user_ids[best_index]
         confidence = max(0.0, min(1.0, 1.0 - best_distance))
-        face_crop = frame[top:bottom, left:right]
-        snapshot = frame_to_base64(face_crop) if face_crop.size else None
 
-        existing = results.get(user_id)
+        existing = matched.get(user_id)
         if not existing or confidence > existing["confidence"]:
-            results[user_id] = {
+            matched[user_id] = {
                 "userId": user_id,
                 "confidence": confidence,
                 "snapshot": snapshot,
-                "bbox": {
-                    "top": int(top),
-                    "right": int(right),
-                    "bottom": int(bottom),
-                    "left": int(left)
-                }
+                "bbox": bbox
             }
 
-    return list(results.values())
+    return {
+        "matches": list(matched.values()),
+        "unknownFaces": unknown_faces
+    }
 
 
 def recognize_faces(video_path):
     cache = load_known_faces()
     known_embeddings = cache["embeddings"]
     known_user_ids = cache["user_ids"]
-
-    if not known_embeddings:
-        return []
 
     cap = cv2.VideoCapture(video_path)
     aggregate = {}
@@ -147,8 +193,8 @@ def recognize_faces(video_path):
             frame_idx += 1
             continue
 
-        frame_matches = match_faces_in_frame(frame, known_embeddings, known_user_ids)
-        for match in frame_matches:
+        analysis = analyze_frame(frame, known_embeddings, known_user_ids)
+        for match in analysis["matches"]:
             user_id = match["userId"]
             existing = aggregate.get(user_id)
             if not existing or match["confidence"] > existing["confidence"]:
@@ -162,9 +208,7 @@ def recognize_faces(video_path):
 
 def recognize_single_frame(frame):
     cache = load_known_faces()
-    known_embeddings = cache["embeddings"]
-    known_user_ids = cache["user_ids"]
-    return match_faces_in_frame(frame, known_embeddings, known_user_ids)
+    return analyze_frame(frame, cache["embeddings"], cache["user_ids"])
 
 
 @app.get("/health")
@@ -210,8 +254,8 @@ def recognize_frame():
     if frame is None:
         return jsonify({"error": "Invalid frame image"}), 400
 
-    matches = recognize_single_frame(frame)
-    return jsonify({"matches": matches})
+    analysis = recognize_single_frame(frame)
+    return jsonify(analysis)
 
 
 if __name__ == "__main__":

@@ -118,8 +118,9 @@ router.post("/frame", frameUpload.single("frame"), async (req, res) => {
 
     const matches = pythonRes.data?.matches || [];
     const enriched = await enrichMatches(matches);
+    const unknownFaces = pythonRes.data?.unknownFaces || [];
 
-    res.json({ matches: enriched });
+    res.json({ matches: enriched, unknownFaces });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Live recognition failed" });

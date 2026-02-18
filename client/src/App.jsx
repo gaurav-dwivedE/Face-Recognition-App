@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 
 const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
-const POLL_MS = 1200;
+const POLL_MS = 900;
 
 const mergePersistentMatches = (previous, incoming) => {
   const now = Date.now();
@@ -52,6 +52,26 @@ const drawBracket = (ctx, left, top, right, bottom, color) => {
   ctx.stroke();
 };
 
+const drawTarget = (ctx, left, top, right, bottom, color) => {
+  const centerX = Math.round((left + right) / 2);
+  const centerY = Math.round((top + bottom) / 2);
+  const radius = Math.max(10, Math.min(right - left, bottom - top) * 0.18);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+  ctx.moveTo(centerX - radius - 6, centerY);
+  ctx.lineTo(centerX - radius + 6, centerY);
+  ctx.moveTo(centerX + radius - 6, centerY);
+  ctx.lineTo(centerX + radius + 6, centerY);
+  ctx.moveTo(centerX, centerY - radius - 6);
+  ctx.lineTo(centerX, centerY - radius + 6);
+  ctx.moveTo(centerX, centerY + radius - 6);
+  ctx.lineTo(centerX, centerY + radius + 6);
+  ctx.stroke();
+};
+
 const formatLastSeen = (timestamp) => {
   if (!timestamp) return "-";
   return new Date(timestamp).toLocaleTimeString([], {
@@ -85,7 +105,7 @@ export default function App() {
     ctx.clearRect(0, 0, overlay.width, overlay.height);
   };
 
-  const drawDetections = (matches, width, height) => {
+  const drawDetections = (matches, unknownList, width, height) => {
     const overlay = overlayCanvasRef.current;
     if (!overlay) return;
 
@@ -100,6 +120,7 @@ export default function App() {
 
       const { left, top, right, bottom } = match.bbox;
       drawBracket(ctx, left, top, right, bottom, "#59c88e");
+      drawTarget(ctx, left, top, right, bottom, "#59c88e");
 
       const label = `${match.user.name} ${(match.confidence * 100).toFixed(0)}%`;
       ctx.font = "13px 'IBM Plex Mono', monospace";
@@ -110,6 +131,24 @@ export default function App() {
 
       ctx.fillRect(labelX - 4, labelY - 15, textWidth + 8, 18);
       ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, labelX, labelY - 2);
+    });
+
+    unknownList.forEach((face) => {
+      if (!face.bbox) return;
+
+      const { left, top, right, bottom } = face.bbox;
+      drawBracket(ctx, left, top, right, bottom, "#ff5d5d");
+      drawTarget(ctx, left, top, right, bottom, "#ff5d5d");
+
+      const label = "? Unknown";
+      ctx.font = "13px 'IBM Plex Mono', monospace";
+      ctx.fillStyle = "rgba(52, 6, 6, 0.86)";
+      const textWidth = ctx.measureText(label).width;
+      const labelX = left;
+      const labelY = Math.max(18, top - 8);
+      ctx.fillRect(labelX - 4, labelY - 15, textWidth + 8, 18);
+      ctx.fillStyle = "#ffd6d6";
       ctx.fillText(label, labelX, labelY - 2);
     });
   };
@@ -178,10 +217,11 @@ export default function App() {
 
         const data = await response.json();
         const frameMatches = data.matches || [];
+        const frameUnknown = data.unknownFaces || [];
 
         setResults((prev) => mergePersistentMatches(prev, frameMatches));
         setLiveUserIds(frameMatches.map((item) => item.user.id));
-        drawDetections(frameMatches, width, height);
+        drawDetections(frameMatches, frameUnknown, width, height);
 
         setStatus("Running");
         setError("");
@@ -204,7 +244,7 @@ export default function App() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user" },
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, min: 15 } },
         audio: false
       });
 
@@ -262,8 +302,6 @@ export default function App() {
 
   return (
     <div className="app">
-  
-
       <section className="card register-card">
         <div className="section-head">
           <h2>Registration</h2>
@@ -339,7 +377,7 @@ export default function App() {
                   <tr>
                     <th>Photo</th>
                     <th>Name</th>
-                    <th>ID</th>
+                    <th>Student ID</th>
                     <th>Confidence</th>
                     <th>State</th>
                     <th>Last Seen</th>

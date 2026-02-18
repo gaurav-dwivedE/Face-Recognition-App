@@ -1,4 +1,6 @@
-#!/Users/gauravdwivedi/Desktop/face-recognition-app/python-service/.venv311/bin/python3.11
+#!/bin/sh
+'''exec' "/Users/gauravdwivedi/Desktop/face-recognition-app /python-service/.venv311/bin/python" "$0" "$@"
+' '''
 import sys
 from flask.cli import main
 if __name__ == '__main__':
